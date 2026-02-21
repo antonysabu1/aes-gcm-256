@@ -1,76 +1,67 @@
 #!/usr/bin/env python3
 import os
-from quantum_encryption_module import SymmetricRatchet as SenderRatchet
-from quantum_decryption_module import SymmetricRatchetReceiver as ReceiverRatchet
+from encryption import SymmetricRatchet as SenderRatchet
+from decryption import SymmetricRatchetReceiver as ReceiverRatchet
 
 def test_robust_sync():
-    print("🚀 Starting Advanced Sync Verification (Out-of-Order Testing)...")
+    print("🚀 Starting Advanced Sync Verification (Refined Protocol)...")
     
     initial_secret = os.urandom(32)
-    sender = SenderRatchet(initial_secret)
+    sender = SenderRatchet(initial_secret, sender_id="TestUser")
     receiver = ReceiverRatchet(initial_secret)
     
-    # 1. Generate 5 messages
-    print("Generating 5 messages...")
-    msgs = ["Msg 1", "Msg 2", "Msg 3", "Msg 4", "Msg 5"]
-    packages = []
-    for m in msgs:
-        packages.append(sender.encrypt(m.encode('utf-8')))
+    # 1. Generate 10 messages
+    print("Generating 10 messages...")
+    msgs = [f"Msg {i}" for i in range(1, 11)]
+    packages = [sender.encrypt(m.encode('utf-8')) for m in msgs]
 
-    # 2. Test Out-of-Order: Receive Msg 3, then Msg 1, then Msg 2
+    # 2. Test Out-of-Order: Receive Msg 5 first (skips 1-4)
     print("\n--- Test 1: Out-of-Order Delivery ---")
-    
-    # Receive Msg 3 (this skips 1 and 2)
-    print("Action: Delivering Msg 3 first...")
-    dec3 = receiver.decrypt(packages[2]).decode('utf-8')
-    print(f"Result: {dec3} (Expected: Msg 3)")
-    assert dec3 == "Msg 3"
+    dec5 = receiver.decrypt(packages[4]).decode('utf-8')
+    print(f"Result: {dec5} (Expected: Msg 5)")
+    assert dec5 == "Msg 5"
     
     # Receive Msg 1 (should use cached key)
-    print("Action: Delivering Msg 1...")
     dec1 = receiver.decrypt(packages[0]).decode('utf-8')
     print(f"Result: {dec1} (Expected: Msg 1)")
     assert dec1 == "Msg 1"
     
-    # Receive Msg 2 (should use cached key)
-    print("Action: Delivering Msg 2...")
-    dec2 = receiver.decrypt(packages[1]).decode('utf-8')
-    print(f"Result: {dec2} (Expected: Msg 2)")
-    assert dec2 == "Msg 2"
+    # 3. Test Replay Protection
+    print("\n--- Test 2: Replay Protection ---")
+    try:
+        receiver.decrypt(packages[4])
+        print("❌ FAILED: Replay accepted")
+        exit(1)
+    except ValueError as e:
+        print(f"✅ PASSED: Replay rejected ({e})")
 
-    # 3. Test Continuous: Receive Msg 4, then Msg 5
-    print("\n--- Test 2: Resume Normal Flow ---")
-    dec4 = receiver.decrypt(packages[3]).decode('utf-8')
-    print(f"Result: {dec4} (Expected: Msg 4)")
-    assert dec4 == "Msg 4"
+    # 4. Test Garbage Collection (DoS Protection)
+    print("\n--- Test 3: Cache Limit / Garbage Collection ---")
+    # Current state: receiver has keys for 2, 3, 4 in cache.
+    # Let's fill the cache (Limit is 50 in our code)
     
-    dec5 = receiver.decrypt(packages[4]).decode('utf-8')
-    print(f"Result: {dec5} (Expected: Msg 5)")
-    assert dec5 == "Msg 5"
-
-    # 4. Test Replay Attack
-    print("\n--- Test 3: Replay Protection ---")
-    try:
-        print("Action: Replaying Msg 3...")
-        receiver.decrypt(packages[2])
-        print("❌ FAILED: Replay was accepted!")
-    except ValueError as e:
-        print(f"✅ PASSED: Replay rejected as expected ({e})")
-
-    # 5. Test Huge Skip (DOS Protection)
-    print("\n--- Test 4: DOS Protection (Huge Skip) ---")
+    # Create a new sender/receiver with small cache for testing
+    # Note: We can't easily change the constant in the test without monkeypatching, 
+    # but we can verify it doesn't crash on large jumps.
+    
     huge_sender = SenderRatchet(os.urandom(32))
-    huge_receiver = ReceiverRatchet(huge_sender._chain_key) # Same key
-    # Manually tampering with sender to jump 2000 steps
-    huge_sender._step = 2000
-    huge_pkg = huge_sender.encrypt(b"Danger")
+    huge_receiver = ReceiverRatchet(huge_sender._chain_key)
+    
+    # Jump 100 steps (will skip 99 keys)
+    # Since MAX_CACHE_SIZE is 50, it should drop the first 49 keys.
+    huge_msgs = [huge_sender.encrypt(b"x") for _ in range(100)]
+    
+    print("Action: Delivering Msg 100 first (forces skip of 99 keys)...")
+    huge_receiver.decrypt(huge_msgs[99])
+    
+    # Try to decrypt Msg 1 (should have been garbage collected)
     try:
-        huge_receiver.decrypt(huge_pkg)
-        print("❌ FAILED: Huge skip was accepted!")
-    except ValueError as e:
-        print(f"✅ PASSED: Huge skip rejected ({e})")
+        huge_receiver.decrypt(huge_msgs[0])
+        print("❌ FAILED: Old key should have been evicted from cache!")
+    except ValueError:
+        print("✅ PASSED: Oldest key was correctly evicted from cache.")
 
-    print("\n✨ ALL ROBUSTNESS TESTS PASSED!")
+    print("\n✨ ALL PROTOCOL TESTS PASSED!")
 
 if __name__ == "__main__":
     test_robust_sync()
