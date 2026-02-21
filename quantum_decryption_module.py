@@ -1,241 +1,141 @@
 #!/usr/bin/env python3
 """
-Quantum-Safe Symmetric Decryption Module (Standalone Version)
---------------------------------------------------------------
-Features:
-- AES-256-GCM Decryption
-- HKDF Key Derivation with salt extraction
-- Symmetric Ratchet (Receiver-side)
-- Secure Memory Wipe (ctypes.memset)
-- Integrated Interactive Testing
-
-Target: Receiver-side (Decryption)
+Quantum-Safe Encryption: Zero-Metadata Protocol
+------------------------------------------------
+Security Fixes:
+1. Future Secrecy: Added root key refreshing capability.
+2. Metadata Privacy: All headers (Seq, TS, ID) are now ENCRYPTED.
+3. No Leaks: Packages contain zero cleartext metadata.
 """
 
 import os
+import time
+import uuid
 import ctypes
+import json
 from typing import Optional
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import HKDF
 from Crypto.Hash import SHA256
 
-# --- CONSTANTS (Must match encryption module) ---
-AES_KEY_SIZE = 32     # 256 bits
-SALT_SIZE = 16        # 128 bits
-NONCE_SIZE = 12       # 96 bits
-TAG_SIZE = 16         # 128 bits
-HKDF_INFO = b"AES-GCM-256-KEY"
+# --- CONSTANTS ---
+AES_KEY_SIZE = 32
+NONCE_SIZE = 12
+TAG_SIZE = 16
+FIXED_PAYLOAD_SIZE = 512  # Every message will be EXACTLY this size + overhead
+HKDF_INFO = b"AES-GCM-256-ZERO-METADATA"
 RATCHET_INFO_CHAIN = b"RATCHET-CHAIN-KEY"
 RATCHET_INFO_MSG = b"RATCHET-MESSAGE-KEY"
 
-# --- CORE UTILITIES ---
-
 def secure_wipe(data: bytes):
-    """Overwrites the memory of a bytes object with zeros."""
-    if not isinstance(data, (bytes, bytearray)):
-        return
-    buf_len = len(data)
-    if buf_len == 0:
-        return
+    """Overwrites memory of sensitive material."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) == 0: return
     try:
         if isinstance(data, bytearray):
-            ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(data)), 0, buf_len)
-        else:
-            # We don't wipe immutable bytes to avoid corruption/segfaults
-            pass
-    except Exception:
-        pass
+            ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(data)), 0, len(data))
+    except Exception: pass
 
-# --- DECRYPTION LOGIC ---
-
-def decrypt_message(
-    shared_secret: bytes,
-    package: bytes,
-    aad: Optional[bytes] = None
-) -> bytes:
+class QuantumDoubleRatchet:
     """
-    Decrypt a message using AES-256-GCM with HKDF-derived key.
-    
-    Structure of package: salt (16) || nonce (12) || ciphertext (...) || tag (16)
+    Implements a Symmetric Ratchet with support for Root Key Refreshing.
+    Provides Zero-Metadata, Constant-Length (Ghost) packets.
     """
-    if len(package) < (SALT_SIZE + NONCE_SIZE + TAG_SIZE):
-        raise ValueError("Invalid package size")
-
-    # 1. Extract components
-    salt = package[:SALT_SIZE]
-    nonce = package[SALT_SIZE:SALT_SIZE+NONCE_SIZE]
-    ciphertext = package[SALT_SIZE+NONCE_SIZE:-TAG_SIZE]
-    tag = package[-TAG_SIZE:]
-
-    # 2. Derive the same AES key using the extracted salt
-    aes_key = HKDF(
-        master=shared_secret,
-        key_len=AES_KEY_SIZE,
-        salt=salt,
-        hashmod=SHA256,
-        context=HKDF_INFO
-    )
-
-    try:
-        # 3. Initialize AES-256-GCM cipher for decryption
-        cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
-        
-        # 4. Add AAD (must match what was used during encryption)
-        if aad is not None:
-            cipher.update(aad)
-        
-        # 5. Decrypt and verify tag
-        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-        return plaintext
-    finally:
-        # 6. Securely wipe the derived key
-        secure_wipe(aes_key)
-
-# --- RATCHET (RECEIVER SIDE) ---
-
-class SymmetricRatchetReceiver:
-    """
-    Implements a robust receiver-side symmetric key ratchet.
-    Handles out-of-order messages and skipped messages using a key cache.
-    """
-    MAX_SKIP = 1000  # Prevent DOS attacks by limiting chain advancement
-
-    def __init__(self, initial_shared_secret: bytes):
-        self._chain_key = bytearray(initial_shared_secret)
+    def __init__(self, shared_secret: bytes, sender_id: str = "User"):
+        self._root_key = shared_secret
+        self._chain_key = bytearray(shared_secret)
         self._step = 0
-        self._skipped_keys = {} # {seq: message_key}
+        self._sender_id = sender_id
 
-    @property
-    def step(self) -> int:
-        return self._step
-
-    def _advance_chain(self) -> bytes:
-        """Internal: Advances the chain and returns the message key for current step."""
-        message_key = HKDF(
-            master=self._chain_key,
+    def refresh_root(self, new_entropy: bytes):
+        """Heals the connection for Future Secrecy."""
+        new_root = HKDF(
+            master=self._root_key + new_entropy,
             key_len=AES_KEY_SIZE,
             salt=None,
             hashmod=SHA256,
-            context=RATCHET_INFO_MSG
+            context=b"ROOT-REFRESH"
         )
-        
-        new_chain_key = HKDF(
-            master=self._chain_key,
-            key_len=AES_KEY_SIZE,
-            salt=None,
-            hashmod=SHA256,
-            context=RATCHET_INFO_CHAIN
-        )
-        
         secure_wipe(self._chain_key)
-        self._chain_key = bytearray(new_chain_key)
+        self._root_key = new_root
+        self._chain_key = bytearray(new_root)
+        self._step = 0
+        print(f"✨ Root Key Refreshed. Connection 'Healed'.")
+
+    def _advance_message_key(self) -> bytes:
+        msg_key = HKDF(self._chain_key, AES_KEY_SIZE, None, SHA256, context=RATCHET_INFO_MSG)
+        new_chain = HKDF(self._chain_key, AES_KEY_SIZE, None, SHA256, context=RATCHET_INFO_CHAIN)
+        secure_wipe(self._chain_key)
+        self._chain_key = bytearray(new_chain)
         self._step += 1
-        return message_key
+        return msg_key
 
-    def decrypt(self, package: bytes, aad: Optional[bytes] = None) -> bytes:
+    def encrypt(self, plaintext: bytes) -> bytes:
         """
-        Decrypt message and advance the receiver ratchet.
-        Now supports out-of-order messages using the prepended sequence number.
+        Pads everything to FIXED_PAYLOAD_SIZE to hide length.
+        Format: [12B Nonce] + [16B Tag] + [Encrypted(HdrLen + Hdr + MsgLen + Msg + Padding)]
         """
-        if len(package) < 4:
-            raise ValueError("Package too small to contain sequence number")
+        msg_key = self._advance_message_key()
+        
+        # 1. Prepare Hidden Header
+        header = {"s": self._sender_id, "n": self._step, "t": int(time.time()), "i": str(uuid.uuid4())[:8]}
+        header_bytes = json.dumps(header).encode('utf-8')
+        
+        # 2. Pack content: [HdrLen] + [Hdr] + [MsgLen] + [Msg]
+        msg_len = len(plaintext).to_bytes(4, 'big')
+        hdr_len = len(header_bytes).to_bytes(4, 'big')
+        content = hdr_len + header_bytes + msg_len + plaintext
 
-        # 1. Extract sequence number
-        seq_bytes = package[:4]
-        msg_seq = int.from_bytes(seq_bytes, 'big')
-        encrypted_data = package[4:]
+        # 3. Add Random Padding (The Ghost noise)
+        if len(content) > FIXED_PAYLOAD_SIZE:
+            raise ValueError(f"Message too large! Max payload is {FIXED_PAYLOAD_SIZE} bytes.")
+        
+        padding_needed = FIXED_PAYLOAD_SIZE - len(content)
+        content += os.urandom(padding_needed) # Pure random noise
 
-        # 2. Build the appropriate AAD (must match sender's format)
-        header_aad = seq_bytes
-        if aad:
-            header_aad += b"|" + aad
+        # 4. Encrypt everything
+        aes_key = HKDF(msg_key, AES_KEY_SIZE, None, SHA256, context=HKDF_INFO)
+        
+        # 5. Generate the BEACON (Blinded Identifier)
+        # This allows the receiver to find the key instantly without trial decryption
+        lookup_id = HKDF(msg_key, 16, None, SHA256, context=b"MESSAGE-LOOKUP-ID")
+        
+        nonce = os.urandom(NONCE_SIZE)
+        cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(content)
+        
+        secure_wipe(aes_key)
+        secure_wipe(msg_key)
 
-        # 3. Use cached key if available (out-of-order delivery)
-        if msg_seq in self._skipped_keys:
-            msg_key = self._skipped_keys.pop(msg_seq)
-            try:
-                plaintext = decrypt_message(msg_key, encrypted_data, aad=header_aad)
-                return plaintext
-            finally:
-                secure_wipe(msg_key)
-
-        # 4. Check if message is too old
-        if msg_seq <= self._step:
-            raise ValueError(f"Message expired or replayed (seq {msg_seq} <= current {self._step})")
-
-        # 5. Catch up if sequence is ahead
-        if msg_seq > self._step + self.MAX_SKIP:
-            raise ValueError("Message sequence too far ahead (potential DOS)")
-
-        # Advance chain until we hit the target sequence
-        while self._step < msg_seq:
-            msg_key = self._advance_chain()
-            if self._step == msg_seq:
-                # This is the key we need now
-                try:
-                    plaintext = decrypt_message(msg_key, encrypted_data, aad=header_aad)
-                    return plaintext
-                finally:
-                    secure_wipe(msg_key)
-            else:
-                # Store this key for later (it was skipped)
-                self._skipped_keys[self._step] = msg_key
-
-
-# --- INTERACTIVE TESTING ---
+        # Final Package: LookupID(16) + Nonce(12) + Tag(16) + Ciphertext
+        return lookup_id + nonce + tag + ciphertext
 
 def main():
     print("\n" + "="*60)
-    print("  🔓 QUANTUM-SAFE DECRYPTION STANDALONE MODULE")
-    print("  (Receiver-Side: Decryption Only)")
+    print("  🔐 QUANTUM-SAFE ENCRYPTION (ZERO-METADATA)")
     print("="*60 + "\n")
 
-    print("[SETUP] To decrypt, you need the EXACT initial shared secret.")
-    secret_hex = input("Enter Shared Secret (Hex) or press Enter to use a test secret: ").strip()
+    shared_secret = os.urandom(32)
+    print(f"✓ Initial Shared Secret: {shared_secret.hex()}")
     
-    if not secret_hex:
-        # For testing, we use a fixed secret that the user might have used in the other module
-        shared_secret = b'\x00' * 32 
-        print("Using default test secret (all zeros).")
-    else:
-        try:
-            shared_secret = bytes.fromhex(secret_hex)
-        except ValueError:
-            print("Invalid Hex string. Exiting.")
-            return
-
-    ratchet = SymmetricRatchetReceiver(shared_secret)
+    ratchet = QuantumDoubleRatchet(shared_secret, sender_id="Antony")
 
     while True:
-        print("-" * 60)
-        package_hex = input("\nPaste Encrypted Package (Hex) to decrypt (or 'q' to quit): ").strip()
-
-        if package_hex.lower() in ['q', 'quit', 'exit']:
-            break
-
-        if not package_hex:
+        msg = input("\nEnter message ('q' to quit, 'refresh' to heal): ").strip()
+        if msg.lower() in ['q', 'quit']: break
+        
+        if msg.lower() == 'refresh':
+            new_seed = os.urandom(32)
+            print(f"New Entropy Seed: {new_seed.hex()}")
+            ratchet.refresh_root(new_seed)
             continue
 
-        aad_str = input("Enter Metadata (AAD) used for this message (optional): ").strip()
-        aad = aad_str.encode('utf-8') if aad_str else None
-
-        try:
-            package = bytes.fromhex(package_hex)
-            # Decrypt using ratchet
-            plaintext = ratchet.decrypt(package, aad=aad)
-            
-            print(f"\n✅ DECRYPTION SUCCESSFUL!")
-            print(f"  Ratchet Step: {ratchet.step}")
-            print(f"  Decrypted Message: {plaintext.decode('utf-8')}")
-            
-        except Exception as e:
-            print(f"\n❌ DECRYPTION FAILED: {e}")
-            print("  Check if the Hex, Secret, AAD, or Ratchet Step is correct.")
+        package = ratchet.encrypt(msg.encode('utf-8'))
+        print(f"\n[OPAQUE PACKAGE GENERATED]")
+        print(f"  Size: {len(package)} bytes")
+        print("-" * 60)
+        print(package.hex())
+        print("-" * 60)
+        print(f"  (Copy the ENTIRE block above, from start to finish!)")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nExited by user.")
-    except Exception as e:
-        print(f"\n❌ ERROR: {e}")
+    main()
