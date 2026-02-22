@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Quantum-Safe Encryption: Zero-Metadata Protocol
+Quantum-Safe Decryption: Zero-Metadata Protocol
 ------------------------------------------------
 Security Fixes:
-1. Future Secrecy: Added root key refreshing capability.
-2. Metadata Privacy: All headers (Seq, TS, ID) are now ENCRYPTED.
-3. No Leaks: Packages contain zero cleartext metadata.
+1. Trial Decryption: No metadata is needed to start decryption.
+2. Privacy: All headers are decrypted only after MAC verification.
+3. Future Secrecy: Added root key refreshing capability.
 """
 
 import os
-import time
-import uuid
 import ctypes
 import json
-from typing import Optional
+import time
+import base64
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import HKDF
 from Crypto.Hash import SHA256
@@ -22,32 +21,72 @@ from Crypto.Hash import SHA256
 AES_KEY_SIZE = 32
 NONCE_SIZE = 12
 TAG_SIZE = 16
-FIXED_PAYLOAD_SIZE = 512  # Every message will be EXACTLY this size + overhead
+FIXED_PAYLOAD_SIZE = 512
 HKDF_INFO = b"AES-GCM-256-ZERO-METADATA"
 RATCHET_INFO_CHAIN = b"RATCHET-CHAIN-KEY"
 RATCHET_INFO_MSG = b"RATCHET-MESSAGE-KEY"
 
 def secure_wipe(data: bytes):
-    """Overwrites memory of sensitive material."""
+    """Overwrites sensitive memory."""
     if not isinstance(data, (bytes, bytearray)) or len(data) == 0: return
     try:
         if isinstance(data, bytearray):
             ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(data)), 0, len(data))
     except Exception: pass
 
-class QuantumDoubleRatchet:
-    """
-    Implements a Symmetric Ratchet with support for Root Key Refreshing.
-    Provides Zero-Metadata, Constant-Length (Ghost) packets.
-    """
-    def __init__(self, shared_secret: bytes, sender_id: str = "User"):
-        self._root_key = shared_secret
-        self._chain_key = bytearray(shared_secret)
+def trial_decrypt(msg_key: bytes, package: bytes) -> bytes:
+    """Attempts to decrypt the opaque package using the candidate message key."""
+    nonce = package[:NONCE_SIZE]
+    tag = package[NONCE_SIZE:NONCE_SIZE+TAG_SIZE]
+    ciphertext = package[NONCE_SIZE+TAG_SIZE:]
+    
+    aes_key = HKDF(msg_key, AES_KEY_SIZE, None, SHA256, context=HKDF_INFO)
+    try:
+        cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
+        decrypted_payload = cipher.decrypt_and_verify(ciphertext, tag)
+        return decrypted_payload
+    except Exception:
+        return None
+    finally:
+        secure_wipe(aes_key)
+
+class QuantumDoubleRatchetReceiver:
+    MAX_SKIP = 100
+    MAX_CACHE = 50
+
+    def __init__(self, initial_shared_secret: bytes):
+        self._root_key = initial_shared_secret
+        self._chain_key = bytearray(initial_shared_secret)
         self._step = 0
-        self._sender_id = sender_id
+        self._skipped_keys = {} # {seq: key}
+        self._lookup_cache = {} # {lookup_id: (key, seq)}
+        self._refresh_lookup_cache()
+
+    def _refresh_lookup_cache(self):
+        """Pre-calculates the next 100 possible message identifiers for instant lookup."""
+        self._lookup_cache.clear()
+        
+        # 1. Index skipped keys
+        for seq, key in self._skipped_keys.items():
+            lid = HKDF(key, 16, None, SHA256, context=b"MESSAGE-LOOKUP-ID")
+            self._lookup_cache[lid] = (key, seq)
+            
+        # 2. Index next 100 keys (Lookahead)
+        temp_chain = bytearray(self._chain_key)
+        temp_step = self._step
+        for i in range(self.MAX_SKIP):
+            candidate_key = HKDF(temp_chain, AES_KEY_SIZE, None, SHA256, context=RATCHET_INFO_MSG)
+            lid = HKDF(candidate_key, 16, None, SHA256, context=b"MESSAGE-LOOKUP-ID")
+            self._lookup_cache[lid] = (candidate_key, temp_step + 1)
+            
+            # Advance shadow chain
+            next_chain = HKDF(temp_chain, AES_KEY_SIZE, None, SHA256, context=RATCHET_INFO_CHAIN)
+            secure_wipe(temp_chain)
+            temp_chain = bytearray(next_chain)
+            temp_step += 1
 
     def refresh_root(self, new_entropy: bytes):
-        """Heals the connection for Future Secrecy."""
+        """Advances the root key to heal the connection."""
         new_root = HKDF(
             master=self._root_key + new_entropy,
             key_len=AES_KEY_SIZE,
@@ -59,9 +98,11 @@ class QuantumDoubleRatchet:
         self._root_key = new_root
         self._chain_key = bytearray(new_root)
         self._step = 0
-        print(f"✨ Root Key Refreshed. Connection 'Healed'.")
+        self._skipped_keys.clear()
+        self._refresh_lookup_cache()
+        print(f"✨ Root Key Refreshed. Connection 'Heal' successful.")
 
-    def _advance_message_key(self) -> bytes:
+    def _advance_chain(self) -> bytes:
         msg_key = HKDF(self._chain_key, AES_KEY_SIZE, None, SHA256, context=RATCHET_INFO_MSG)
         new_chain = HKDF(self._chain_key, AES_KEY_SIZE, None, SHA256, context=RATCHET_INFO_CHAIN)
         secure_wipe(self._chain_key)
@@ -69,73 +110,102 @@ class QuantumDoubleRatchet:
         self._step += 1
         return msg_key
 
-    def encrypt(self, plaintext: bytes) -> bytes:
-        """
-        Pads everything to FIXED_PAYLOAD_SIZE to hide length.
-        Format: [12B Nonce] + [16B Tag] + [Encrypted(HdrLen + Hdr + MsgLen + Msg + Padding)]
-        """
-        msg_key = self._advance_message_key()
-        
-        # 1. Prepare Hidden Header
-        header = {"s": self._sender_id, "n": self._step, "t": int(time.time()), "i": str(uuid.uuid4())[:8]}
-        header_bytes = json.dumps(header).encode('utf-8')
-        
-        # 2. Pack content: [HdrLen] + [Hdr] + [MsgLen] + [Msg]
-        msg_len = len(plaintext).to_bytes(4, 'big')
-        hdr_len = len(header_bytes).to_bytes(4, 'big')
-        content = hdr_len + header_bytes + msg_len + plaintext
+    def decrypt(self, package: bytes) -> bytes:
+        """Instant lookup using the Blinded Identifier Beacon."""
+        if len(package) < (16 + NONCE_SIZE + TAG_SIZE): raise ValueError("Blob too small")
 
-        # 3. Add Random Padding (The Ghost noise)
-        if len(content) > FIXED_PAYLOAD_SIZE:
-            raise ValueError(f"Message too large! Max payload is {FIXED_PAYLOAD_SIZE} bytes.")
-        
-        padding_needed = FIXED_PAYLOAD_SIZE - len(content)
-        content += os.urandom(padding_needed) # Pure random noise
+        # 1. Extract Beacon
+        beacon = package[:16]
+        crypto_blob = package[16:]
 
-        # 4. Encrypt everything
-        aes_key = HKDF(msg_key, AES_KEY_SIZE, None, SHA256, context=HKDF_INFO)
-        
-        # 5. Generate the BEACON (Blinded Identifier)
-        # This allows the receiver to find the key instantly without trial decryption
-        lookup_id = HKDF(msg_key, 16, None, SHA256, context=b"MESSAGE-LOOKUP-ID")
-        
-        nonce = os.urandom(NONCE_SIZE)
-        cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
-        ciphertext, tag = cipher.encrypt_and_digest(content)
-        
-        secure_wipe(aes_key)
-        secure_wipe(msg_key)
+        # 2. FAST LOOKUP (O(1))
+        if beacon in self._lookup_cache:
+            match_key, match_seq = self._lookup_cache[beacon]
+            
+            # Case A: It was a skipped key
+            if match_seq in self._skipped_keys:
+                del self._skipped_keys[match_seq]
+                res = trial_decrypt(match_key, crypto_blob)
+                self._refresh_lookup_cache()
+                return self._unpack(res)
+            
+            # Case B: It is in the future (advance real chain)
+            while self._step < match_seq:
+                key = self._advance_chain()
+                if self._step == match_seq:
+                    res = trial_decrypt(key, crypto_blob)
+                    self._refresh_lookup_cache() # Update cache for next message
+                    return self._unpack(res)
+                else:
+                    self._skipped_keys[self._step] = key
 
-        # Final Package: LookupID(16) + Nonce(12) + Tag(16) + Ciphertext
-        return lookup_id + nonce + tag + ciphertext
+        raise ValueError("Decryption Failure: Unknown Beacon (Identification failed)")
+
+    def _unpack(self, decrypted_payload: bytes) -> bytes:
+        """Parses the hidden header and message, ignoring random padding."""
+        # 1. Extract Header
+        h_len = int.from_bytes(decrypted_payload[:4], 'big')
+        header_bytes = decrypted_payload[4:4+h_len]
+        header = json.loads(header_bytes.decode('utf-8'))
+        
+        # 2. Extract Message
+        m_start = 4 + h_len
+        m_len = int.from_bytes(decrypted_payload[m_start:m_start+4], 'big')
+        message = decrypted_payload[m_start+4 : m_start+4+m_len]
+        
+        # Note: Everything after m_len is random padding (noise) which we discard.
+        
+        print(f"📩 Decrypted from {header['s']} | Seq: {header['n']} | ID: {header['i']}")
+        return message
+
+def smart_load_secret(input_str: str) -> bytes:
+    """Detects and loads 32-byte secret from Hex or Base64."""
+    input_str = input_str.strip()
+    try:
+        if len(input_str) == 64: # Likely Hex
+            return bytes.fromhex(input_str)
+        # Base64 for 32 bytes is 44 characters
+        if len(input_str) == 44 or input_str.endswith('='):
+            decoded = base64.b64decode(input_str)
+            if len(decoded) == 32: return decoded
+    except Exception: pass
+    raise ValueError("Invalid Key Format. Must be 32 bytes (64 Hex or 44 Base64 chars).")
 
 def main():
     print("\n" + "="*60)
-    print("  🔐 QUANTUM-SAFE ENCRYPTION (ZERO-METADATA)")
+    print("  🔓 QUANTUM-SAFE DECRYPTION (ZERO-METADATA)")
     print("="*60 + "\n")
 
-    shared_secret = os.urandom(32)
-    print(f"✓ Initial Shared Secret: {shared_secret.hex()}")
+    secret_input = input("Enter Shared Secret (Hex or Base64): ").strip()
+    try:
+        shared_secret = smart_load_secret(secret_input)
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return
     
-    ratchet = QuantumDoubleRatchet(shared_secret, sender_id="Antony")
+    ratchet = QuantumDoubleRatchetReceiver(shared_secret)
 
     while True:
-        msg = input("\nEnter message ('q' to quit, 'refresh' to heal): ").strip()
-        if msg.lower() in ['q', 'quit']: break
-        
-        if msg.lower() == 'refresh':
-            new_seed = os.urandom(32)
-            print(f"New Entropy Seed: {new_seed.hex()}")
-            ratchet.refresh_root(new_seed)
+        line = input("\nPaste Package or 'refresh': ").strip()
+        if line.lower() == 'q': break
+        if line.lower() == 'refresh':
+            ent = input("Enter Entropy Hex: ").strip()
+            ratchet.refresh_root(bytes.fromhex(ent))
             continue
+            
+        try:
+            # Length Check: 556 bytes = 1112 hex characters
+            expected_chars = (16 + NONCE_SIZE + TAG_SIZE + FIXED_PAYLOAD_SIZE) * 2
+            if len(line) < expected_chars:
+                print(f"⚠️  WARNING: Your copy looks too short! (Found {len(line)}, expected {expected_chars})")
+                print("Make sure you copy the ENTIRE hex block from the top.")
+                continue
 
-        package = ratchet.encrypt(msg.encode('utf-8'))
-        print(f"\n[OPAQUE PACKAGE GENERATED]")
-        print(f"  Size: {len(package)} bytes")
-        print("-" * 60)
-        print(package.hex())
-        print("-" * 60)
-        print(f"  (Copy the ENTIRE block above, from start to finish!)")
+            package = bytes.fromhex(line)
+            plaintext = ratchet.decrypt(package)
+            print(f"✅ DECRYPTED: {plaintext.decode('utf-8')}")
+        except Exception as e:
+            print(f"❌ FAILED: {e}")
 
 if __name__ == "__main__":
     main()
